@@ -1,6 +1,8 @@
 # gwent-multiplayer-service
 
-Minimal v1 backend for `gwent-classic` multiplayer queueing.
+Backend service for PvP support in `gwent-classic`.
+
+This service owns matchmaking, player-scoped match state, server timers, and increasing portions of the actual game rules so PvP can behave like PvC while still remaining authoritative.
 
 ## Run locally
 
@@ -9,22 +11,116 @@ npm install
 npm run dev
 ```
 
-The service runs on `http://localhost:3001` by default.
+Default local address:
+
+- `http://localhost:3001`
 
 ## Environment
 
-Copy `.env.example` values into your shell if needed:
+Example local configuration:
 
 ```bash
 export PORT=3001
 export ALLOWED_ORIGIN=http://localhost:5173
 ```
 
+## Service role
+
+This backend is responsible for:
+
+- anonymous queue matchmaking
+- match creation
+- player-scoped state serialization
+- turn deadlines and redraw deadlines
+- hidden-information protection
+- validating PvP actions
+- resolving backend-owned game rules
+- pushing queue and match updates to clients
+
+## Architecture
+
+Current module layout:
+
+- `src/server.mjs`
+  - HTTP bootstrap and route wiring
+- `src/realtime.mjs`
+  - WebSocket subscriptions and push fanout
+- `src/http.mjs`
+  - JSON and CORS helpers
+- `src/config.mjs`
+  - runtime config
+- `src/store.mjs`
+  - in-memory queue and match storage
+- `src/queue-service.mjs`
+  - queue lifecycle
+- `src/cards.mjs`
+  - card metadata and supported-card helpers
+- `src/match-service.mjs`
+  - match creation, state serialization, deadlines, rules, and action handling
+- `src/utils.mjs`
+  - shared helpers
+
+## Data model
+
+The service currently keeps everything in memory.
+
+Main in-memory structures:
+
+- `queue`
+  - players waiting to be matched
+- `matches`
+  - keyed by `matchId`
+  - stores:
+    - player identities
+    - deck snapshots
+    - authoritative match state
+    - event log
+    - timers and phase information
+
+## Transport flow
+
+Current transport model:
+
+- HTTP
+  - join queue
+  - leave queue
+  - fetch bootstrap
+  - send actions
+- WebSocket
+  - queue status push
+  - match state push
+
+The frontend still uses snapshots, but this backend already emits ordered events so the frontend can move toward full event-driven replay.
+
 ## Current API
 
 ### `GET /health`
 
-Returns service status, queued player count, and active match count.
+Returns service status and basic counts.
+
+### `GET /ws`
+
+WebSocket endpoint used by the frontend.
+
+Client subscribe messages:
+
+```json
+{ "type": "subscribe_queue", "playerId": "anonymous-client-id" }
+```
+
+```json
+{ "type": "subscribe_match", "playerId": "anonymous-client-id", "matchId": "uuid" }
+```
+
+Server push messages:
+
+```json
+{ "type": "queue_status", "playerId": "anonymous-client-id", "payload": { "status": "queued", "matchId": null, "opponent": null } }
+```
+
+```json
+{ "type": "match_state", "playerId": "anonymous-client-id", "matchId": "uuid", "payload": { "...": "player-scoped match state" } }
+```
 
 ### `POST /queue/join`
 
@@ -38,28 +134,6 @@ Request body:
 }
 ```
 
-Response:
-
-```json
-{
-  "status": "queued",
-  "matchId": null
-}
-```
-
-Or, when another player is waiting:
-
-```json
-{
-  "status": "matched",
-  "matchId": "uuid",
-  "opponent": {
-    "playerId": "other-player-id",
-    "displayName": "Skellige-4821"
-  }
-}
-```
-
 ### `POST /queue/leave`
 
 Request body:
@@ -70,14 +144,104 @@ Request body:
 }
 ```
 
-### `GET /match/:matchId`
+### `GET /queue/status?playerId=...`
 
-Returns the stored in-memory match payload for debugging.
+Returns whether the player is still queued or already matched.
 
-## Notes
+### `GET /match/:matchId?playerId=...`
 
-- State is in-memory only.
-- Queueing works.
-- Match creation works.
-- Real gameplay synchronization is not implemented yet.
-- This is intended to be the first backend step for the PvP UI in `gwent-classic`.
+Returns player-scoped bootstrap or current match state.
+
+### `POST /match/:matchId/action`
+
+Used for PvP actions such as:
+
+- `ready`
+- `decline_ready`
+- `redraw_card`
+- `finish_redraw`
+- `pass`
+- `forfeit`
+- `play_card`
+- `resolve_choice`
+- `activate_leader`
+
+## Match flow
+
+Current server-side flow:
+
+1. Player joins queue with an anonymous id and deck snapshot.
+2. Backend either stores the player in queue or matches them immediately.
+3. Once matched, backend creates a match with two player states.
+4. Both players must confirm `ready`.
+5. Backend decides starting player, with faction/leader overrides where applicable.
+6. Backend enters redraw phase.
+7. Each player redraws independently, up to 2 cards.
+8. When both are done, backend enters active phase.
+9. During active play:
+   - action is validated
+   - authoritative state is mutated
+   - ordered event log entries are appended
+   - updated player-scoped state is pushed
+10. On round end:
+   - backend resolves totals, round winner, faction effects, and next round
+11. On match end:
+   - winner is stored
+   - completed state is pushed
+
+## Hidden information design
+
+The backend intentionally returns player-scoped state.
+
+That means:
+
+- a player sees their own hand
+- a player sees their own deck snapshot where needed
+- a player sees only public opponent deck metadata
+- hidden draw details are sanitized from opponent event views
+
+This is why the backend must remain authoritative for PvP.
+
+## Current design direction
+
+The long-term target is:
+
+- backend owns rule legality and ordering
+- backend emits ordered gameplay events
+- frontend replays those events through the original board presentation
+- snapshots become mainly a recovery/reconnect tool
+
+## Current status
+
+What is already in place:
+
+- queue matchmaking
+- ready flow
+- redraw phase
+- player-scoped state
+- WebSocket push
+- event log
+- server-owned card instance ids
+- server-owned turn and redraw deadlines
+- many card, faction, and leader rules already ported
+
+What is still being refined:
+
+- exact PvC-presentation parity
+- some remaining animation/event sequencing gaps
+- reconnect/session hardening
+- broader runtime hardening for public hosting
+
+## Hosting notes
+
+This service is intentionally simple to self-host:
+
+- single Node process
+- in-memory state
+- no database required for local use
+
+That also means:
+
+- server restarts clear active matches
+- horizontal scale is not supported yet
+- this is still hobby-grade multiplayer infrastructure, not production-grade

@@ -1,92 +1,22 @@
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
-
-const port = Number(process.env.PORT || 3001);
-const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-
-const queue = [];
-const matches = new Map();
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function sendJson(res, statusCode, payload, origin = "*") {
-  res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
-  });
-  res.end(JSON.stringify(payload));
-}
-
-function getOrigin(req) {
-  const origin = req.headers.origin;
-  if (!origin) {
-    return allowedOrigin === "*" ? "*" : allowedOrigin;
-  }
-  if (allowedOrigin === "*" || origin === allowedOrigin) {
-    return origin;
-  }
-  return allowedOrigin;
-}
-
-async function readJson(req) {
-  const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(chunk);
-  }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
-}
-
-function removeQueuedPlayer(playerId) {
-  const index = queue.findIndex((entry) => entry.playerId === playerId);
-  if (index === -1) {
-    return null;
-  }
-  return queue.splice(index, 1)[0];
-}
-
-function createMatch(playerA, playerB) {
-  const matchId = randomUUID();
-  const match = {
-    matchId,
-    createdAt: nowIso(),
-    status: "matched",
-    players: [
-      {
-        playerId: playerA.playerId,
-        displayName: playerA.displayName,
-        deck: playerA.deck
-      },
-      {
-        playerId: playerB.playerId,
-        displayName: playerB.displayName,
-        deck: playerB.deck
-      }
-    ]
-  };
-  matches.set(matchId, match);
-  return match;
-}
-
-function findMatchByPlayerId(playerId) {
-  return [...matches.values()].find((match) =>
-    match.players.some((player) => player.playerId === playerId)
-  );
-}
+import { port } from "./config.mjs";
+import { getOrigin, readJson, sendJson } from "./http.mjs";
+import { createMatch, createPlayerScopedState, applyMatchAction, deleteMatchesForPlayer, expireTimedPhases, findMatchByPlayerId } from "./match-service.mjs";
+import { pruneQueue, removeQueuedPlayer, createQueuedEntry } from "./queue-service.mjs";
+import { broadcastMatchState, broadcastQueueStatus, createRealtimeServer } from "./realtime.mjs";
+import { matches, queue } from "./store.mjs";
 
 const server = createServer(async (req, res) => {
   const origin = getOrigin(req);
+  const url = new URL(req.url, `http://localhost:${port}`);
 
   if (req.method === "OPTIONS") {
     sendJson(res, 204, {}, origin);
     return;
   }
 
-  if (req.method === "GET" && req.url === "/health") {
+  if (req.method === "GET" && url.pathname === "/health") {
+    pruneQueue();
     sendJson(res, 200, {
       ok: true,
       service: "gwent-multiplayer-service",
@@ -96,8 +26,9 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && req.url === "/queue/join") {
+  if (req.method === "POST" && url.pathname === "/queue/join") {
     try {
+      pruneQueue();
       const body = await readJson(req);
       const playerId = String(body.playerId || "").trim();
       const displayName = String(body.displayName || "").trim();
@@ -111,47 +42,42 @@ const server = createServer(async (req, res) => {
       }
 
       removeQueuedPlayer(playerId);
+      deleteMatchesForPlayer(playerId, ["completed"]);
 
       const existingMatch = findMatchByPlayerId(playerId);
-
-      if (existingMatch) {
+      if (existingMatch && existingMatch.status !== "completed") {
         sendJson(res, 200, {
           status: "matched",
           matchId: existingMatch.matchId,
           opponent: existingMatch.players.find((player) => player.playerId !== playerId) || null
         }, origin);
+        broadcastQueueStatus(playerId);
         return;
       }
 
-      const queuedEntry = {
-        playerId,
-        displayName,
-        deck,
-        joinedAt: nowIso()
-      };
-
       const opponent = queue.shift();
-
       if (!opponent) {
-        queue.push(queuedEntry);
+        queue.push(createQueuedEntry(playerId, displayName, deck));
         sendJson(res, 200, {
           status: "queued",
           matchId: null
         }, origin);
+        broadcastQueueStatus(playerId);
         return;
       }
 
-      const match = createMatch(opponent, queuedEntry);
-      const opponentPublic = {
-        playerId: opponent.playerId,
-        displayName: opponent.displayName
-      };
-
+      const match = createMatch(opponent, createQueuedEntry(playerId, displayName, deck));
       sendJson(res, 200, {
         status: "matched",
         matchId: match.matchId,
-        opponent: opponentPublic
+        opponent: {
+          playerId: opponent.playerId,
+          displayName: opponent.displayName
+        }
       }, origin);
+      broadcastQueueStatus(playerId);
+      broadcastQueueStatus(opponent.playerId);
+      broadcastMatchState(match);
       return;
     } catch (error) {
       sendJson(res, 500, {
@@ -161,8 +87,9 @@ const server = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === "POST" && req.url === "/queue/leave") {
+  if (req.method === "POST" && url.pathname === "/queue/leave") {
     try {
+      pruneQueue();
       const body = await readJson(req);
       const playerId = String(body.playerId || "").trim();
 
@@ -177,6 +104,7 @@ const server = createServer(async (req, res) => {
       sendJson(res, 200, {
         status: removed ? "left_queue" : "not_queued"
       }, origin);
+      broadcastQueueStatus(playerId);
       return;
     } catch (error) {
       sendJson(res, 500, {
@@ -186,8 +114,8 @@ const server = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === "GET" && req.url.startsWith("/queue/status")) {
-    const url = new URL(req.url, `http://localhost:${port}`);
+  if (req.method === "GET" && url.pathname === "/queue/status") {
+    pruneQueue();
     const playerId = String(url.searchParams.get("playerId") || "").trim();
 
     if (!playerId) {
@@ -200,7 +128,7 @@ const server = createServer(async (req, res) => {
     const match = findMatchByPlayerId(playerId);
     if (match) {
       sendJson(res, 200, {
-        status: "matched",
+        status: match.status === "active" ? "matched" : match.status,
         matchId: match.matchId,
         opponent: match.players.find((player) => player.playerId !== playerId) || null
       }, origin);
@@ -216,8 +144,91 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url.startsWith("/match/")) {
-    const matchId = req.url.replace("/match/", "").trim();
+  if (req.method === "POST" && url.pathname.startsWith("/match/") && url.pathname.endsWith("/action")) {
+    const parts = url.pathname.split("/").filter(Boolean);
+    const matchId = parts[1];
+
+    if (!matchId || !matches.has(matchId)) {
+      sendJson(res, 404, {
+        error: "Match not found."
+      }, origin);
+      return;
+    }
+
+    try {
+      const body = await readJson(req);
+      const playerId = String(body.playerId || "").trim();
+      const action = String(body.action || "").trim();
+
+      if (!playerId || !action) {
+        sendJson(res, 400, {
+          error: "playerId and action are required."
+        }, origin);
+        return;
+      }
+
+      const match = matches.get(matchId);
+      expireTimedPhases(match);
+      const result = applyMatchAction(match, playerId, action, body);
+      sendJson(res, result.statusCode, result.payload, origin);
+      if (result.statusCode < 400) {
+        if (action === "decline_ready") {
+          broadcastQueueStatus(playerId);
+          if (result.payload?.requeuedOpponentPlayerId) {
+            broadcastQueueStatus(result.payload.requeuedOpponentPlayerId);
+          }
+        } else {
+          broadcastMatchState(match);
+          for (const player of match.players) {
+            broadcastQueueStatus(player.playerId);
+          }
+        }
+      }
+      return;
+    } catch (error) {
+      sendJson(res, 500, {
+        error: "Unable to process match action."
+      }, origin);
+      return;
+    }
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/match/") && url.pathname.endsWith("/state")) {
+    const parts = url.pathname.split("/").filter(Boolean);
+    const matchId = parts[1];
+    const playerId = String(url.searchParams.get("playerId") || "").trim();
+
+    if (!matchId || !matches.has(matchId)) {
+      sendJson(res, 404, {
+        error: "Match not found."
+      }, origin);
+      return;
+    }
+
+    if (!playerId) {
+      sendJson(res, 400, {
+        error: "playerId is required."
+      }, origin);
+      return;
+    }
+
+    const match = matches.get(matchId);
+    expireTimedPhases(match);
+    const scoped = createPlayerScopedState(match, playerId);
+    if (!scoped) {
+      sendJson(res, 403, {
+        error: "Player is not part of this match."
+      }, origin);
+      return;
+    }
+
+    sendJson(res, 200, scoped, origin);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/match/")) {
+    const matchId = url.pathname.replace("/match/", "").trim();
+
     if (!matchId || !matches.has(matchId)) {
       sendJson(res, 404, {
         error: "Match not found."
@@ -226,7 +237,22 @@ const server = createServer(async (req, res) => {
     }
 
     const match = matches.get(matchId);
-    sendJson(res, 200, match, origin);
+    expireTimedPhases(match);
+    const playerId = String(url.searchParams.get("playerId") || "").trim();
+    if (!playerId) {
+      sendJson(res, 200, match, origin);
+      return;
+    }
+
+    const scoped = createPlayerScopedState(match, playerId);
+    if (!scoped) {
+      sendJson(res, 403, {
+        error: "Player is not part of this match."
+      }, origin);
+      return;
+    }
+
+    sendJson(res, 200, scoped, origin);
     return;
   }
 
@@ -234,6 +260,8 @@ const server = createServer(async (req, res) => {
     error: "Route not found."
   }, origin);
 });
+
+createRealtimeServer(server);
 
 server.listen(port, () => {
   console.log(`gwent-multiplayer-service listening on http://localhost:${port}`);
