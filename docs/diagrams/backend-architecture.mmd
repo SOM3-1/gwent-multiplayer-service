@@ -1,0 +1,28 @@
+flowchart TB
+    Server["server.mjs<br/>HTTP entry point"]
+    Http["http.mjs<br/>JSON and CORS helpers"]
+    Realtime["realtime.mjs<br/>WebSocket subscriptions"]
+    Queue["queue-service.mjs<br/>queue lifecycle"]
+    Match["match-service.mjs<br/>authoritative rules and state"]
+    Cards["cards.mjs + card-data.mjs<br/>card metadata and helpers"]
+    Store["store.mjs<br/>in-memory queue and matches"]
+    Config["config.mjs<br/>runtime config"]
+
+    Server --> Http
+    Server --> Realtime
+    Server --> Queue
+    Server --> Match
+    Server --> Config
+    Realtime --> Match
+    Realtime --> Store
+    Queue --> Store
+    Match --> Store
+    Match --> Cards
+
+    classDef entry fill:#f7f2e8,stroke:#5d4632,stroke-width:2,color:#1f1a17;
+    classDef service fill:#e7efe8,stroke:#355c3a,stroke-width:2,color:#142016;
+    classDef state fill:#e8eef7,stroke:#365a86,stroke-width:2,color:#162233;
+
+    class Server,Config entry;
+    class Http,Realtime,Queue,Match,Cards service;
+    class Store state;

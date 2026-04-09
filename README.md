@@ -4,9 +4,12 @@ Backend service for PvP support in `gwent-classic`.
 
 This service owns matchmaking, player-scoped match state, server timers, and increasing portions of the actual game rules so PvP can behave like PvC while still remaining authoritative.
 
+For local backend architecture documentation, see [docs/backend-architecture.md](./docs/backend-architecture.md).
+
 ## Run locally
 
 ```bash
+cd gwent-multiplayer-service
 npm install
 npm run dev
 ```
@@ -20,9 +23,28 @@ Default local address:
 Example local configuration:
 
 ```bash
+cd gwent-multiplayer-service
 export PORT=3001
 export ALLOWED_ORIGIN=http://localhost:5173
+npm run dev
 ```
+
+To run the frontend against this service:
+
+```bash
+cd gwent-classic
+export VITE_GWENT_MULTIPLAYER_URL=http://localhost:3001
+npm run dev
+```
+
+## Getting oriented
+
+Recommended reading order:
+
+1. [`src/server.mjs`](/Users/dush/Gwent/gwent-multiplayer-service/src/server.mjs)
+2. [`src/realtime.mjs`](/Users/dush/Gwent/gwent-multiplayer-service/src/realtime.mjs)
+3. [`src/match-service.mjs`](/Users/dush/Gwent/gwent-multiplayer-service/src/match-service.mjs)
+4. [Backend architecture doc](./docs/backend-architecture.md)
 
 ## Service role
 
@@ -36,6 +58,7 @@ This backend is responsible for:
 - validating PvP actions
 - resolving backend-owned game rules
 - pushing queue and match updates to clients
+- enforcing redraw timeouts so matches progress even without new client actions
 
 ## Architecture
 
@@ -90,7 +113,30 @@ Current transport model:
   - queue status push
   - match state push
 
-The frontend still uses snapshots, but this backend already emits ordered events so the frontend can move toward full event-driven replay.
+The frontend still uses snapshots as the source of truth, but this backend also emits ordered events so the frontend can move toward full event-driven replay.
+
+## How snapshots work
+
+The backend does not send one shared raw match object to both players during normal PvP flow.
+
+Instead it builds a player-scoped snapshot for each player:
+
+- self hand and self deck details stay visible to that player
+- opponent hidden information is removed
+- public board state stays shared
+- event log entries are sanitized before delivery
+
+That player-scoped snapshot is built by `createPlayerScopedState(...)` in [`src/match-service.mjs`](/Users/dush/Gwent/gwent-multiplayer-service/src/match-service.mjs).
+
+The delivery pattern is:
+
+1. client fetches bootstrap over HTTP
+2. client subscribes over WebSocket
+3. backend validates each action
+4. backend mutates authoritative state and appends ordered events
+5. backend pushes a fresh player-scoped snapshot to both players
+
+This hybrid approach makes reconnect and recovery simpler while the frontend continues moving toward fuller event replay.
 
 ## Current API
 

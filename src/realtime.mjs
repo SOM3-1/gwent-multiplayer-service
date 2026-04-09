@@ -1,6 +1,6 @@
 import { WebSocketServer } from "ws";
-import { findMatchByPlayerId, createPlayerScopedState } from "./match-service.mjs";
-import { queue } from "./store.mjs";
+import { findMatchByPlayerId, createPlayerScopedState, expireTimedPhases } from "./match-service.mjs";
+import { queue, matches } from "./store.mjs";
 
 const sockets = new Set();
 
@@ -100,6 +100,37 @@ export function createRealtimeServer(server) {
     });
   });
 
+  const interval = setInterval(() => {
+    for (const match of matches.values()) {
+      if (!match || match.status !== "active" || match.gameState.phase !== "redraw" || !match.gameState.redrawDeadlineAt) {
+        continue;
+      }
+      const beforePhase = match.gameState.phase;
+      const beforeDeadline = match.gameState.redrawDeadlineAt;
+      const beforeStates = match.players.map((player) => {
+        const state = match.gameState.players[player.playerId];
+        return state ? `${state.redrawComplete}-${state.redrawRemaining}` : "";
+      });
+      expireTimedPhases(match);
+      const afterPhase = match.gameState.phase;
+      const afterDeadline = match.gameState.redrawDeadlineAt;
+      const afterStates = match.players.map((player) => {
+        const state = match.gameState.players[player.playerId];
+        return state ? `${state.redrawComplete}-${state.redrawRemaining}` : "";
+      });
+      const changed = beforePhase !== afterPhase
+        || beforeDeadline !== afterDeadline
+        || beforeStates.some((state, index) => state !== afterStates[index]);
+      if (changed) {
+        broadcastMatchState(match);
+      }
+    }
+  }, 1000);
+
+  wss.on("close", () => {
+    clearInterval(interval);
+  });
+
   return wss;
 }
 
@@ -123,6 +154,7 @@ export function broadcastMatchState(match) {
   if (!match) {
     return;
   }
+  expireTimedPhases(match);
   for (const player of match.players) {
     const scoped = createPlayerScopedState(match, player.playerId);
     if (!scoped) {

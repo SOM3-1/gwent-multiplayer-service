@@ -1,0 +1,21 @@
+sequenceDiagram
+    participant A as Player A frontend
+    participant B as Player B frontend
+    participant S as Multiplayer service
+
+    A->>S: POST /queue/join
+    B->>S: POST /queue/join
+    S-->>A: matched + matchId
+    S-->>B: matched + matchId
+
+    A->>S: GET /match/:id?playerId=A
+    B->>S: GET /match/:id?playerId=B
+    A->>S: subscribe_match
+    B->>S: subscribe_match
+
+    A->>S: POST action
+    S->>S: validate action
+    S->>S: mutate authoritative state
+    S->>S: append ordered events
+    S-->>A: player-scoped snapshot
+    S-->>B: player-scoped snapshot

@@ -1,0 +1,11 @@
+stateDiagram-v2
+    [*] --> queued
+    queued --> matched
+    matched --> waiting_ready
+    waiting_ready --> redraw
+    redraw --> active
+    active --> active: validated actions
+    active --> round_end
+    round_end --> redraw: next round
+    round_end --> completed: match winner
+    matched --> queued: ready declined

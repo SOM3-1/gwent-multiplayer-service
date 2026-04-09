@@ -254,9 +254,9 @@ export function createPlayerScopedState(match, playerId) {
       deckCount: match.gameState.players[self.playerId].deck.length,
       graveCount: match.gameState.players[self.playerId].grave.length,
       rows: {
-        close: match.gameState.players[self.playerId].rows.close.map(getCardId),
-        ranged: match.gameState.players[self.playerId].rows.ranged.map(getCardId),
-        siege: match.gameState.players[self.playerId].rows.siege.map(getCardId)
+        close: match.gameState.players[self.playerId].rows.close.map(serializeCardInstance),
+        ranged: match.gameState.players[self.playerId].rows.ranged.map(serializeCardInstance),
+        siege: match.gameState.players[self.playerId].rows.siege.map(serializeCardInstance)
       },
       specialRows: {
         close: match.gameState.players[self.playerId].specialRows.close ? getCardId(match.gameState.players[self.playerId].specialRows.close) : null,
@@ -282,9 +282,9 @@ export function createPlayerScopedState(match, playerId) {
       deckCount: match.gameState.players[opponent.playerId].deck.length,
       graveCount: match.gameState.players[opponent.playerId].grave.length,
       rows: {
-        close: match.gameState.players[opponent.playerId].rows.close.map(getCardId),
-        ranged: match.gameState.players[opponent.playerId].rows.ranged.map(getCardId),
-        siege: match.gameState.players[opponent.playerId].rows.siege.map(getCardId)
+        close: match.gameState.players[opponent.playerId].rows.close.map(serializeCardInstance),
+        ranged: match.gameState.players[opponent.playerId].rows.ranged.map(serializeCardInstance),
+        siege: match.gameState.players[opponent.playerId].rows.siege.map(serializeCardInstance)
       },
       specialRows: {
         close: match.gameState.players[opponent.playerId].specialRows.close ? getCardId(match.gameState.players[opponent.playerId].specialRows.close) : null,
@@ -601,12 +601,28 @@ function resetRound(match, previousRoundWinnerPlayerId = null) {
       });
     }
   }
+  const keptInstanceIds = new Set(keptUnits.map((entry) => entry.cardEntry?.instanceId).filter(Boolean));
   const skelligeRevives = [];
   match.round += 1;
   match.turnNumber += 1;
   for (const player of match.players) {
     player.passed = false;
     match.gameState.players[player.playerId].passed = false;
+    const playerState = match.gameState.players[player.playerId];
+    for (const rowName of ["close", "ranged", "siege"]) {
+      for (const cardEntry of playerState.rows[rowName]) {
+        if (keptInstanceIds.has(cardEntry.instanceId)) {
+          continue;
+        }
+        playerState.grave.push(cardEntry);
+      }
+    }
+    for (const rowName of ["close", "ranged", "siege"]) {
+      const special = playerState.specialRows[rowName];
+      if (special) {
+        playerState.grave.push(special);
+      }
+    }
     match.gameState.players[player.playerId].rows = {
       close: [],
       ranged: [],
@@ -1523,7 +1539,7 @@ export function applyMatchAction(match, playerId, action, payload = {}) {
         return { statusCode: 200, payload: createPlayerScopedState(match, playerId) };
       }
       if (opponent.passed) {
-        stayOnCurrentTurn(match);
+        resolveRound(match);
       } else {
         advanceTurn(match, playerId);
       }
@@ -1565,7 +1581,7 @@ export function applyMatchAction(match, playerId, action, payload = {}) {
         round: match.round
       });
       if (opponent.passed) {
-        stayOnCurrentTurn(match);
+        resolveRound(match);
       } else {
         advanceTurn(match, playerId);
       }
@@ -1593,7 +1609,7 @@ export function applyMatchAction(match, playerId, action, payload = {}) {
         round: match.round
       });
       if (opponent.passed) {
-        stayOnCurrentTurn(match);
+        resolveRound(match);
       } else {
         advanceTurn(match, playerId);
       }
@@ -1654,7 +1670,7 @@ export function applyMatchAction(match, playerId, action, payload = {}) {
       }
       match.gameState.pendingChoice = null;
       if (opponent.passed) {
-        stayOnCurrentTurn(match);
+        resolveRound(match);
       } else {
         advanceTurn(match, playerId);
       }
@@ -1680,7 +1696,7 @@ export function applyMatchAction(match, playerId, action, payload = {}) {
         round: match.round
       });
       if (opponent.passed) {
-        stayOnCurrentTurn(match);
+        resolveRound(match);
       } else {
         advanceTurn(match, playerId);
       }
@@ -1689,7 +1705,7 @@ export function applyMatchAction(match, playerId, action, payload = {}) {
     if (match.gameState.pendingChoice.type === "leader_hand_reveal") {
       match.gameState.pendingChoice = null;
       if (opponent.passed) {
-        stayOnCurrentTurn(match);
+        resolveRound(match);
       } else {
         advanceTurn(match, playerId);
       }
